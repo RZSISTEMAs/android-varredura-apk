@@ -1,5 +1,6 @@
 package expo.modules.androidscanner
 
+import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
@@ -34,14 +35,45 @@ class AndroidScannerModule : Module() {
       val freeBytes = availableBlocks * blockSize
       val usedBytes = totalBytes - freeBytes
 
+      val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+      val memInfo = ActivityManager.MemoryInfo()
+      activityManager.getMemoryInfo(memInfo)
+
+      val hasAllFilesAccess = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        Environment.isExternalStorageManager()
+      } else {
+        true
+      }
+
       mapOf(
         "totalBytes" to totalBytes,
         "freeBytes" to freeBytes,
         "usedBytes" to usedBytes,
+        "totalRamBytes" to memInfo.totalMem,
+        "freeRamBytes" to memInfo.availMem,
         "deviceModel" to "${Build.MANUFACTURER} ${Build.MODEL}",
         "androidVersion" to Build.VERSION.RELEASE,
-        "sdkInt" to Build.VERSION.SDK_INT
+        "sdkInt" to Build.VERSION.SDK_INT,
+        "hasAllFilesAccess" to hasAllFilesAccess,
+        "rootStoragePath" to Environment.getExternalStorageDirectory().absolutePath
       )
+    }
+
+    Function("requestAllFilesAccess") {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        try {
+          val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+            data = Uri.parse("package:${context.packageName}")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          }
+          context.startActivity(intent)
+        } catch (e: Exception) {
+          val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          }
+          context.startActivity(intent)
+        }
+      }
     }
 
     AsyncFunction("scanInstalledApps") {
@@ -102,7 +134,7 @@ class AndroidScannerModule : Module() {
           .map { it.substringAfterLast(".") }
 
         var riskScore = 0
-        val riskReasons = ArrayList<String>()
+        val riskReasons = mutableListOf("").apply { clear() }
 
         if (isSideloaded) {
           riskScore += 45
@@ -118,7 +150,7 @@ class AndroidScannerModule : Module() {
         }
         if (dangerousFound.contains("READ_SMS") || dangerousFound.contains("RECEIVE_SMS")) {
           riskScore += 25
-          riskReasons.add("Acesso a leitura/recebimento de SMS")
+          riskReasons.add("Acesso a leitura ou recebimento de SMS")
         }
         if (dangerousFound.size >= 4) {
           riskScore += 15
@@ -154,39 +186,88 @@ class AndroidScannerModule : Module() {
     }
 
     AsyncFunction("scanJunkFiles") {
-      val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+      val rootDir = Environment.getExternalStorageDirectory()
+      val targetDirs = listOf(
+        File(rootDir, "Download"),
+        File(rootDir, "Documents"),
+        File(rootDir, "Pictures"),
+        File(rootDir, "Movies"),
+        File(rootDir, "DCIM")
+      )
+
       val junkList = mutableListOf(emptyMap<String, Any>()).apply { clear() }
 
-      if (downloadsDir != null && downloadsDir.exists() && downloadsDir.isDirectory) {
-        downloadsDir.walkTopDown().maxDepth(3).forEach { file ->
-          if (file.isFile) {
-            val name = file.name.lowercase()
-            val isApk = name.endsWith(".apk") || name.endsWith(".xapk")
-            val isTemp = name.endsWith(".tmp") || name.endsWith(".log") || name.endsWith(".bak")
-            val isLargeFile = file.length() > 50 * 1024 * 1024
+      for (dir in targetDirs) {
+        if (dir.exists() && dir.isDirectory) {
+          dir.walkTopDown().maxDepth(4).forEach { file ->
+            if (file.isFile && !file.name.startsWith(".")) {
+              val name = file.name.lowercase()
+              val isApk = name.endsWith(".apk") || name.endsWith(".xapk") || name.endsWith(".apks")
+              val isTemp = name.endsWith(".tmp") || name.endsWith(".log") || name.endsWith(".bak") || name.endsWith(".cache")
+              val isMedia = name.endsWith(".mp4") || name.endsWith(".mkv") || name.endsWith(".zip") || name.endsWith(".rar")
+              val isLargeFile = file.length() > 30 * 1024 * 1024
 
-            if (isApk || isTemp || isLargeFile) {
-              val category = when {
-                isApk -> "APK_RESIDUAL"
-                isTemp -> "TEMPORARIO"
-                else -> "ARQUIVO_GRANDE"
-              }
+              if (isApk || isTemp || isLargeFile) {
+                val category = when {
+                  isApk -> "APK_RESIDUAL"
+                  isTemp -> "TEMPORARIO"
+                  isMedia -> "MIDIA_PESADA"
+                  else -> "ARQUIVO_GRANDE"
+                }
 
-              junkList.add(
-                mapOf(
-                  "name" to file.name,
-                  "path" to file.absolutePath,
-                  "size" to file.length(),
-                  "category" to category,
-                  "sha256" to if (isApk) calculateSha256(file) else ""
+                junkList.add(
+                  mapOf(
+                    "name" to file.name,
+                    "path" to file.absolutePath,
+                    "folder" to (file.parentFile?.name ?: "Raiz"),
+                    "size" to file.length(),
+                    "lastModified" to file.lastModified(),
+                    "category" to category,
+                    "sha256" to if (isApk) calculateSha256(file) else ""
+                  )
                 )
-              )
+              }
             }
           }
         }
       }
 
       junkList.sortedByDescending { it["size"] as Long }
+    }
+
+    AsyncFunction("listDirectory") { dirPath: String? ->
+      val target = if (dirPath.isNullOrBlank()) {
+        Environment.getExternalStorageDirectory()
+      } else {
+        File(dirPath)
+      }
+
+      val entries = mutableListOf(emptyMap<String, Any>()).apply { clear() }
+
+      if (target != null && target.exists() && target.isDirectory) {
+        val children = target.listFiles() ?: emptyArray()
+        for (child in children) {
+          if (child.name.startsWith(".")) continue
+          val isDir = child.isDirectory
+          val count = if (isDir) (child.listFiles()?.size ?: 0) else 0
+
+          entries.add(
+            mapOf(
+              "name" to child.name,
+              "path" to child.absolutePath,
+              "isDirectory" to isDir,
+              "size" to if (isDir) 0L else child.length(),
+              "lastModified" to child.lastModified(),
+              "itemCount" to count
+            )
+          )
+        }
+      }
+
+      entries.sortedWith(
+        compareByDescending> { it["isDirectory"] as Boolean }
+          .thenBy { (it["name"] as String).lowercase() }
+      )
     }
 
     AsyncFunction("deleteFile") { filePath: String ->
@@ -196,6 +277,17 @@ class AndroidScannerModule : Module() {
       } else {
         false
       }
+    }
+
+    AsyncFunction("deleteMultipleFiles") { filePaths: List<String> ->
+      var removedCount = 0
+      for (path in filePaths) {
+        val file = File(path)
+        if (file.exists() && file.canWrite() && file.delete()) {
+          removedCount++
+        }
+      }
+      removedCount
     }
 
     Function("openAppSettings") { packageName: String ->

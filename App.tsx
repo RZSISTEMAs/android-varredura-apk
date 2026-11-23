@@ -1,7 +1,8 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   PermissionsAndroid,
   Platform,
   SafeAreaView,
@@ -13,10 +14,14 @@ import {
   View,
 } from 'react-native';
 import AndroidScanner, {
+  DirectoryEntry,
   JunkFile,
   ScannedApp,
   StorageInfo,
 } from './modules/android-scanner';
+
+type ScreenTab = 'HOME' | 'REPORT' | 'CLEANER' | 'FILES';
+type AppFilter = 'ALL' | 'RISK' | 'SIDELOAD';
 
 function formatBytes(bytes: number): string {
   if (!bytes || bytes <= 0) return '0 B';
@@ -26,29 +31,72 @@ function formatBytes(bytes: number): string {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`;
 }
 
+function formatDate(timestamp: number): string {
+  if (!timestamp) return '';
+  const d = new Date(timestamp);
+  return d.toLocaleDateString('pt-BR');
+}
+
 export default function App() {
+  const [activeTab, setActiveTab] = useState<ScreenTab>('HOME');
   const [storage, setStorage] = useState<StorageInfo | null>(null);
   const [apps, setApps] = useState<ScannedApp[]>([]);
   const [junkFiles, setJunkFiles] = useState<JunkFile[]>([]);
   const [scanning, setScanning] = useState(false);
+  const [scanStep, setScanStep] = useState('');
   const [scanCompleted, setScanCompleted] = useState(false);
-  const [activeTab, setActiveTab] = useState<'APPS' | 'CLEANER'>('APPS');
+  const [lastScanTime, setLastScanTime] = useState<string | null>(null);
+  const [appFilter, setAppFilter] = useState<AppFilter>('ALL');
 
-  useEffect(() => {
-    loadStorage();
-  }, []);
+  // Estado do Explorador de Arquivos
+  const [currentPath, setCurrentPath] = useState<string>('');
+  const [dirEntries, setDirEntries] = useState<DirectoryEntry[]>([]);
+  const [loadingFiles, setLoadingFiles] = useState(false);
 
-  async function loadStorage() {
+  const loadSystemInfo = useCallback(async () => {
     if (Platform.OS !== 'android') return;
     try {
       const info = await AndroidScanner.getStorageInfo();
       setStorage(info);
+      if (!currentPath && info.rootStoragePath) {
+        setCurrentPath(info.rootStoragePath);
+      }
     } catch (e) {
-      console.warn('Erro ao ler armazenamento:', e);
+      console.warn('Erro ao ler sistema:', e);
     }
-  }
+  }, [currentPath]);
 
-  async function requestStoragePermissions() {
+  useEffect(() => {
+    loadSystemInfo();
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        loadSystemInfo();
+      }
+    });
+    return () => sub.remove();
+  }, [loadSystemInfo]);
+
+  const loadDirectory = useCallback(async (targetPath?: string) => {
+    if (Platform.OS !== 'android') return;
+    setLoadingFiles(true);
+    try {
+      const list = await AndroidScanner.listDirectory(targetPath);
+      setDirEntries(list);
+      if (targetPath) setCurrentPath(targetPath);
+    } catch (e) {
+      console.warn('Erro ao listar pasta:', e);
+    } finally {
+      setLoadingFiles(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'FILES') {
+      loadDirectory(currentPath || storage?.rootStoragePath);
+    }
+  }, [activeTab, currentPath, storage?.rootStoragePath, loadDirectory]);
+
+  async function requestPermissions() {
     if (Platform.OS !== 'android') return;
     if (Platform.Version < 33) {
       await PermissionsAndroid.requestMultiple([
@@ -58,7 +106,7 @@ export default function App() {
     }
   }
 
-  async function runFullScan() {
+  async function runFullScan(goToReport = false) {
     if (Platform.OS !== 'android') {
       Alert.alert('Aviso', 'A varredura nativa funciona apenas em dispositivos Android.');
       return;
@@ -68,42 +116,58 @@ export default function App() {
     setScanCompleted(false);
 
     try {
-      await requestStoragePermissions();
-      const [storageData, scannedApps, foundJunk] = await Promise.all([
-        AndroidScanner.getStorageInfo(),
-        AndroidScanner.scanInstalledApps(),
-        AndroidScanner.scanJunkFiles(),
-      ]);
-
+      setScanStep('1/4 • Verificando permissões e armazenamento...');
+      await requestPermissions();
+      const storageData = await AndroidScanner.getStorageInfo();
       setStorage(storageData);
+
+      setScanStep('2/4 • Auditando pacotes e assinaturas instaladas...');
+      const scannedApps = await AndroidScanner.scanInstalledApps();
       setApps(scannedApps);
+
+      setScanStep('3/4 • Rastreando APKs residuais e arquivos pesados...');
+      const foundJunk = await AndroidScanner.scanJunkFiles();
       setJunkFiles(foundJunk);
+
+      setScanStep('4/4 • Finalizando relatório de diagnóstico...');
+      const now = new Date();
+      setLastScanTime(
+        `${now.toLocaleDateString('pt-BR')} às ${now.toLocaleTimeString('pt-BR', {
+          hour: '2-digit',
+          minute: '2-digit',
+        })}`
+      );
       setScanCompleted(true);
+
+      if (goToReport) {
+        setActiveTab('REPORT');
+      }
     } catch (error: any) {
       Alert.alert('Erro na varredura', error?.message || 'Falha ao executar diagnóstico.');
     } finally {
       setScanning(false);
+      setScanStep('');
     }
   }
 
-  async function handleDeleteJunk(file: JunkFile) {
+  async function handleDeleteSingleJunk(file: JunkFile) {
     Alert.alert(
-      'Remover arquivo',
-      `Deseja apagar permanentemente "${file.name}" (${formatBytes(file.size)})?`,
+      'Confirmar limpeza',
+      `Deseja remover "${file.name}" (${formatBytes(file.size)})?`,
       [
         { text: 'Cancelar', style: 'cancel' },
         {
           text: 'Apagar',
           style: 'destructive',
           onPress: async () => {
-            const deleted = await AndroidScanner.deleteFile(file.path);
-            if (deleted) {
+            const ok = await AndroidScanner.deleteFile(file.path);
+            if (ok) {
               setJunkFiles((prev) => prev.filter((item) => item.path !== file.path));
-              loadStorage();
+              loadSystemInfo();
             } else {
               Alert.alert(
-                'Permissão necessária',
-                'O Android bloqueou a exclusão direta deste arquivo. Remova-o pelo gerenciador de arquivos do sistema.'
+                'Acesso restrito',
+                'Ative a permissão "Acesso a todos os arquivos" na tela inicial para apagar arquivos fora da pasta do app.'
               );
             }
           },
@@ -112,287 +176,829 @@ export default function App() {
     );
   }
 
+  async function handleCleanAllJunk() {
+    if (junkFiles.length === 0) return;
+    Alert.alert(
+      'Limpeza Completa',
+      `Deseja apagar todos os ${junkFiles.length} itens encontrados (${formatBytes(totalJunkBytes)})?`,
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Limpar Tudo',
+          style: 'destructive',
+          onPress: async () => {
+            const paths = junkFiles.map((f) => f.path);
+            const removed = await AndroidScanner.deleteMultipleFiles(paths);
+            const updatedJunk = await AndroidScanner.scanJunkFiles();
+            setJunkFiles(updatedJunk);
+            loadSystemInfo();
+            Alert.alert('Limpeza concluída', `${removed} arquivo(s) removido(s) com sucesso.`);
+          },
+        },
+      ]
+    );
+  }
+
+  async function handleDeleteExplorerFile(entry: DirectoryEntry) {
+    Alert.alert(
+      'Excluir arquivo',
+      `Deseja apagar "${entry.name}" (${formatBytes(entry.size)}) permanentemente?`,
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Excluir',
+          style: 'destructive',
+          onPress: async () => {
+            const ok = await AndroidScanner.deleteFile(entry.path);
+            if (ok) {
+              loadDirectory(currentPath);
+              loadSystemInfo();
+            } else {
+              Alert.alert(
+                'Não foi possível excluir',
+                'Verifique se a permissão "Acesso a todos os arquivos" está ativada na tela inicial.'
+              );
+            }
+          },
+        },
+      ]
+    );
+  }
+
+  function handleNavigateUp() {
+    const root = storage?.rootStoragePath || '/storage/emulated/0';
+    if (!currentPath || currentPath === root) return;
+    const parent = currentPath.substring(0, currentPath.lastIndexOf('/'));
+    loadDirectory(parent.length >= root.length ? parent : root);
+  }
+
+  // Cálculos de saúde e estatísticas
   const highRiskCount = apps.filter((a) => a.riskLevel === 'ALTO').length;
   const mediumRiskCount = apps.filter((a) => a.riskLevel === 'MEDIO').length;
+  const sideloadCount = apps.filter((a) => a.isSideloaded).length;
   const totalJunkBytes = junkFiles.reduce((acc, item) => acc + item.size, 0);
-  const usedPercent = storage
+
+  const usedStoragePercent = storage
     ? Math.min(100, Math.round((storage.usedBytes / storage.totalBytes) * 100))
     : 0;
 
+  const usedRamPercent =
+    storage && storage.totalRamBytes > 0
+      ? Math.min(
+          100,
+          Math.round(((storage.totalRamBytes - storage.freeRamBytes) / storage.totalRamBytes) * 100)
+        )
+      : 0;
+
+  // Score de saúde do aparelho (0 a 100)
+  const healthScore = !scanCompleted
+    ? 92
+    : Math.max(25, 100 - highRiskCount * 18 - mediumRiskCount * 7 - (junkFiles.length > 5 ? 8 : 0));
+
+  const healthColor =
+    healthScore >= 80 ? '#10B981' : healthScore >= 55 ? '#F59E0B' : '#EF4444';
+
+  const healthLabel = !scanCompleted
+    ? 'Pronto para Varredura'
+    : healthScore >= 80
+    ? 'Sistema Protegido'
+    : healthScore >= 55
+    ? 'Atenção Recomendada'
+    : 'Riscos Detectados';
+
+  const filteredApps = apps.filter((app) => {
+    if (appFilter === 'RISK') return app.riskLevel !== 'SEGURO';
+    if (appFilter === 'SIDELOAD') return app.isSideloaded;
+    return true;
+  });
+
   return (
     <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#0B1120" />
+      <StatusBar barStyle="light-content" backgroundColor="#060B19" />
 
-      <ScrollView contentContainerStyle={styles.scrollContent}>
-        <View style={styles.header}>
-          <Text style={styles.brand}>RZ SISTEMAS • SECURITY</Text>
-          <Text style={styles.title}>Varredura & Limpeza</Text>
-          {storage && (
-            <Text style={styles.subtitle}>
-              {storage.deviceModel} • Android {storage.androidVersion} (API {storage.sdkInt})
-            </Text>
-          )}
+      {/* Top Bar */}
+      <View style={styles.topBar}>
+        <View>
+          <Text style={styles.brandTag}>RZ SISTEMAS • SECURITY SUITE</Text>
+          <Text style={styles.topTitle}>RZ Varredura</Text>
         </View>
-
-        <View style={styles.card}>
-          <View style={styles.rowBetween}>
-            <Text style={styles.cardTitle}>Armazenamento Interno</Text>
-            <Text style={styles.percentText}>{usedPercent}% usado</Text>
+        {storage && (
+          <View style={styles.devicePill}>
+            <Text style={styles.devicePillText}>Android {storage.androidVersion}</Text>
           </View>
+        )}
+      </View>
 
-          <View style={styles.progressBarBg}>
-            <View style={[styles.progressBarFill, { width: `${usedPercent}%` }]} />
-          </View>
-
-          {storage && (
-            <View style={styles.rowBetween}>
-              <Text style={styles.metaText}>Livre: {formatBytes(storage.freeBytes)}</Text>
-              <Text style={styles.metaText}>Total: {formatBytes(storage.totalBytes)}</Text>
-            </View>
-          )}
-        </View>
-
-        <TouchableOpacity
-          style={[styles.scanButton, scanning && styles.scanButtonDisabled]}
-          onPress={runFullScan}
-          disabled={scanning}
-        >
-          {scanning ? (
-            <View style={styles.rowCenter}>
-              <ActivityIndicator color="#0B1120" style={{ marginRight: 10 }} />
-              <Text style={styles.scanButtonText}>Analisando sistema e pacotes...</Text>
-            </View>
-          ) : (
-            <Text style={styles.scanButtonText}>
-              {scanCompleted ? 'Executar Nova Varredura' : 'Iniciar Varredura Completa'}
-            </Text>
-          )}
-        </TouchableOpacity>
-
-        {scanCompleted && (
+      <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+        {/* ==================== TELA 1: INÍCIO ==================== */}
+        {activeTab === 'HOME' && (
           <>
-            <View style={styles.statsGrid}>
-              <View style={styles.statBox}>
-                <Text style={styles.statNumber}>{apps.length}</Text>
-                <Text style={styles.statLabel}>Apps Auditados</Text>
-              </View>
-              <View style={styles.statBox}>
-                <Text style={[styles.statNumber, { color: highRiskCount > 0 ? '#EF4444' : '#10B981' }]}>
-                  {highRiskCount + mediumRiskCount}
-                </Text>
-                <Text style={styles.statLabel}>Alertas de Risco</Text>
-              </View>
-              <View style={styles.statBox}>
-                <Text style={[styles.statNumber, { color: '#38BDF8' }]}>
-                  {formatBytes(totalJunkBytes)}
-                </Text>
-                <Text style={styles.statLabel}>Lixo / APKs</Text>
-              </View>
-            </View>
-
-            <View style={styles.tabContainer}>
+            {/* Banner de Permissão Android 15 */}
+            {storage && !storage.hasAllFilesAccess && (
               <TouchableOpacity
-                style={[styles.tabButton, activeTab === 'APPS' && styles.tabButtonActive]}
-                onPress={() => setActiveTab('APPS')}
+                style={styles.permissionBanner}
+                onPress={() => AndroidScanner.requestAllFilesAccess()}
               >
-                <Text style={[styles.tabText, activeTab === 'APPS' && styles.tabTextActive]}>
-                  Segurança ({apps.length})
-                </Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={[styles.tabButton, activeTab === 'CLEANER' && styles.tabButtonActive]}
-                onPress={() => setActiveTab('CLEANER')}
-              >
-                <Text style={[styles.tabText, activeTab === 'CLEANER' && styles.tabTextActive]}>
-                  Limpeza ({junkFiles.length})
-                </Text>
-              </TouchableOpacity>
-            </View>
-
-            {activeTab === 'APPS' &&
-              apps.map((app) => {
-                const badgeColor =
-                  app.riskLevel === 'ALTO'
-                    ? '#EF4444'
-                    : app.riskLevel === 'MEDIO'
-                    ? '#F59E0B'
-                    : '#10B981';
-
-                return (
-                  <View key={app.packageName} style={styles.itemCard}>
-                    <View style={styles.rowBetween}>
-                      <View style={{ flex: 1, paddingRight: 8 }}>
-                        <Text style={styles.itemTitle}>{app.appName}</Text>
-                        <Text style={styles.itemSub}>{app.packageName}</Text>
-                      </View>
-                      <View style={[styles.badge, { backgroundColor: `${badgeColor}22`, borderColor: badgeColor }]}>
-                        <Text style={[styles.badgeText, { color: badgeColor }]}>{app.riskLevel}</Text>
-                      </View>
-                    </View>
-
-                    <Text style={styles.metaTextSmall}>
-                      Origem: {app.isSideloaded ? 'Fora da Play Store' : 'Loja Oficial'} • Tamanho:{' '}
-                      {formatBytes(app.apkSize)}
-                    </Text>
-
-                    {app.riskReasons.length > 0 && (
-                      <View style={styles.reasonsBox}>
-                        {app.riskReasons.map((reason, idx) => (
-                          <Text key={idx} style={styles.reasonText}>
-                            • {reason}
-                          </Text>
-                        ))}
-                      </View>
-                    )}
-
-                    {app.riskLevel !== 'SEGURO' && (
-                      <TouchableOpacity
-                        style={styles.actionOutlineBtn}
-                        onPress={() => AndroidScanner.openAppSettings(app.packageName)}
-                      >
-                        <Text style={styles.actionOutlineText}>Inspecionar / Desinstalar no Android</Text>
-                      </TouchableOpacity>
-                    )}
-                  </View>
-                );
-              })}
-
-            {activeTab === 'CLEANER' &&
-              (junkFiles.length === 0 ? (
-                <View style={styles.card}>
-                  <Text style={styles.emptyText}>
-                    Nenhum APK residual ou arquivo temporário encontrado na pasta Downloads!
+                <View style={{ flex: 1, paddingRight: 10 }}>
+                  <Text style={styles.permissionTitle}>Ativar Leitura Completa de Arquivos</Text>
+                  <Text style={styles.permissionDesc}>
+                    Toque aqui para liberar o acesso às pastas do Android {storage.androidVersion} e permitir limpeza profunda.
                   </Text>
                 </View>
-              ) : (
-                junkFiles.map((file) => (
-                  <View key={file.path} style={styles.itemCard}>
-                    <View style={styles.rowBetween}>
-                      <View style={{ flex: 1, paddingRight: 8 }}>
-                        <Text style={styles.itemTitle}>{file.name}</Text>
-                        <Text style={styles.itemSub}>
-                          {file.category} • {formatBytes(file.size)}
-                        </Text>
-                      </View>
-                      <TouchableOpacity
-                        style={styles.deleteBtn}
-                        onPress={() => handleDeleteJunk(file)}
+                <View style={styles.permissionBtn}>
+                  <Text style={styles.permissionBtnText}>Ativar</Text>
+                </View>
+              </TouchableOpacity>
+            )}
+
+            {/* Card Principal com Medidor de Saúde */}
+            <View style={styles.heroCard}>
+              <View style={[styles.scoreRing, { borderColor: healthColor }]}>
+                <Text style={[styles.scoreValue, { color: healthColor }]}>{healthScore}%</Text>
+                <Text style={styles.scoreSub}>SAÚDE</Text>
+              </View>
+
+              <Text style={[styles.healthStatus, { color: healthColor }]}>{healthLabel}</Text>
+              <Text style={styles.deviceSubtitle}>
+                {storage ? storage.deviceModel : 'Carregando hardware...'}
+              </Text>
+              {lastScanTime && (
+                <Text style={styles.lastScanText}>Última varredura: {lastScanTime}</Text>
+              )}
+
+              <TouchableOpacity
+                style={[styles.primaryCta, scanning && { opacity: 0.75 }]}
+                onPress={() => runFullScan(false)}
+                disabled={scanning}
+              >
+                {scanning ? (
+                  <View style={styles.rowCenter}>
+                    <ActivityIndicator color="#060B19" style={{ marginRight: 10 }} />
+                    <Text style={styles.primaryCtaText}>Varrendo Sistema...</Text>
+                  </View>
+                ) : (
+                  <Text style={styles.primaryCtaText}>
+                    {scanCompleted ? 'Executar Nova Varredura' : 'Iniciar Varredura Completa'}
+                  </Text>
+                )}
+              </TouchableOpacity>
+
+              {scanning && scanStep ? <Text style={styles.stepIndicator}>{scanStep}</Text> : null}
+
+              {scanCompleted && !scanning && (
+                <TouchableOpacity
+                  style={styles.secondaryCta}
+                  onPress={() => setActiveTab('REPORT')}
+                >
+                  <Text style={styles.secondaryCtaText}>
+                    Ver Relatório Completo ({apps.length} apps • {junkFiles.length} arquivos)
+                  </Text>
+                </TouchableOpacity>
+              )}
+            </View>
+
+            {/* Métricas de Hardware (Armazenamento + RAM) */}
+            {storage && (
+              <View style={styles.metricsRow}>
+                <View style={styles.metricCard}>
+                  <View style={styles.rowBetween}>
+                    <Text style={styles.metricLabel}>Armazenamento</Text>
+                    <Text style={styles.metricPercent}>{usedStoragePercent}%</Text>
+                  </View>
+                  <View style={styles.barBg}>
+                    <View style={[styles.barFill, { width: `${usedStoragePercent}%` }]} />
+                  </View>
+                  <Text style={styles.metricDetail}>
+                    {formatBytes(storage.freeBytes)} livres de {formatBytes(storage.totalBytes)}
+                  </Text>
+                </View>
+
+                <View style={styles.metricCard}>
+                  <View style={styles.rowBetween}>
+                    <Text style={styles.metricLabel}>Memória RAM</Text>
+                    <Text style={[styles.metricPercent, { color: '#A78BFA' }]}>
+                      {usedRamPercent}%
+                    </Text>
+                  </View>
+                  <View style={styles.barBg}>
+                    <View
+                      style={[
+                        styles.barFill,
+                        { width: `${usedRamPercent}%`, backgroundColor: '#A78BFA' },
+                      ]}
+                    />
+                  </View>
+                  <Text style={styles.metricDetail}>
+                    {formatBytes(storage.freeRamBytes)} livres de {formatBytes(storage.totalRamBytes)}
+                  </Text>
+                </View>
+              </View>
+            )}
+
+            {/* Ações Rápidas */}
+            <Text style={styles.sectionHeading}>Ferramentas do Sistema</Text>
+            <View style={styles.toolsGrid}>
+              <TouchableOpacity style={styles.toolCard} onPress={() => setActiveTab('REPORT')}>
+                <Text style={styles.toolTitle}>Auditoria de Apps</Text>
+                <Text style={styles.toolDesc}>
+                  {scanCompleted
+                    ? `${highRiskCount + mediumRiskCount} alerta(s) em ${apps.length} apps`
+                    : 'Permissões e sideloading'}
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity style={styles.toolCard} onPress={() => setActiveTab('CLEANER')}>
+                <Text style={styles.toolTitle}>Limpeza Inteligente</Text>
+                <Text style={styles.toolDesc}>
+                  {scanCompleted
+                    ? `${formatBytes(totalJunkBytes)} prontos para limpar`
+                    : 'APKs e arquivos residuais'}
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity style={styles.toolCard} onPress={() => setActiveTab('FILES')}>
+                <Text style={styles.toolTitle}>Explorar Arquivos</Text>
+                <Text style={styles.toolDesc}>Navegar pastas do celular</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity style={styles.toolCard} onPress={() => runFullScan(true)}>
+                <Text style={styles.toolTitle}>Diagnóstico Total</Text>
+                <Text style={styles.toolDesc}>Varrer e abrir relatório</Text>
+              </TouchableOpacity>
+            </View>
+          </>
+        )}
+
+        {/* ==================== TELA 2: RELATÓRIO COMPLETO & APPS ==================== */}
+        {activeTab === 'REPORT' && (
+          <>
+            <View style={styles.sectionHeaderRow}>
+              <Text style={styles.pageTitle}>Relatório da Varredura</Text>
+              <TouchableOpacity style={styles.miniRefreshBtn} onPress={() => runFullScan(false)}>
+                <Text style={styles.miniRefreshText}>Reescanear</Text>
+              </TouchableOpacity>
+            </View>
+
+            {!scanCompleted ? (
+              <View style={styles.emptyCard}>
+                <Text style={styles.emptyTitle}>Nenhuma varredura executada ainda</Text>
+                <Text style={styles.emptySub}>
+                  Inicie a varredura completa para auditar todos os aplicativos, permissões e arquivos do aparelho.
+                </Text>
+                <TouchableOpacity style={styles.primaryCta} onPress={() => runFullScan(false)}>
+                  <Text style={styles.primaryCtaText}>Iniciar Varredura Agora</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <>
+                {/* Resumo Consolidado */}
+                <View style={styles.summaryCard}>
+                  <View style={styles.summaryItem}>
+                    <Text style={styles.summaryVal}>{apps.length}</Text>
+                    <Text style={styles.summaryLbl}>Apps</Text>
+                  </View>
+                  <View style={styles.summaryItem}>
+                    <Text style={[styles.summaryVal, { color: '#EF4444' }]}>{highRiskCount}</Text>
+                    <Text style={styles.summaryLbl}>Risco Alto</Text>
+                  </View>
+                  <View style={styles.summaryItem}>
+                    <Text style={[styles.summaryVal, { color: '#F59E0B' }]}>{sideloadCount}</Text>
+                    <Text style={styles.summaryLbl}>Fora da Loja</Text>
+                  </View>
+                  <View style={styles.summaryItem}>
+                    <Text style={[styles.summaryVal, { color: '#38BDF8' }]}>
+                      {formatBytes(totalJunkBytes)}
+                    </Text>
+                    <Text style={styles.summaryLbl}>Limpeza</Text>
+                  </View>
+                </View>
+
+                {/* Filtros */}
+                <View style={styles.filterRow}>
+                  {(
+                    [
+                      { key: 'ALL', label: `Todos (${apps.length})` },
+                      { key: 'RISK', label: `Alertas (${highRiskCount + mediumRiskCount})` },
+                      { key: 'SIDELOAD', label: `Externos (${sideloadCount})` },
+                    ] as { key: AppFilter; label: string }[]
+                  ).map((f) => (
+                    <TouchableOpacity
+                      key={f.key}
+                      style={[styles.filterChip, appFilter === f.key && styles.filterChipActive]}
+                      onPress={() => setAppFilter(f.key)}
+                    >
+                      <Text
+                        style={[
+                          styles.filterChipText,
+                          appFilter === f.key && styles.filterChipTextActive,
+                        ]}
                       >
-                        <Text style={styles.deleteBtnText}>Limpar</Text>
+                        {f.label}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                {/* Lista de Aplicativos */}
+                {filteredApps.map((app) => {
+                  const badgeColor =
+                    app.riskLevel === 'ALTO'
+                      ? '#EF4444'
+                      : app.riskLevel === 'MEDIO'
+                      ? '#F59E0B'
+                      : '#10B981';
+
+                  return (
+                    <View key={app.packageName} style={styles.itemCard}>
+                      <View style={styles.rowBetween}>
+                        <View style={{ flex: 1, paddingRight: 8 }}>
+                          <Text style={styles.itemTitle}>{app.appName}</Text>
+                          <Text style={styles.itemSub}>
+                            {app.packageName} • v{app.versionName}
+                          </Text>
+                        </View>
+                        <View
+                          style={[
+                            styles.badge,
+                            { backgroundColor: `${badgeColor}20`, borderColor: badgeColor },
+                          ]}
+                        >
+                          <Text style={[styles.badgeText, { color: badgeColor }]}>
+                            {app.riskLevel} ({app.riskScore})
+                          </Text>
+                        </View>
+                      </View>
+
+                      <Text style={styles.metaTextSmall}>
+                        Origem: {app.isSideloaded ? 'Fora da Play Store' : 'Play Store / Oficial'} •{' '}
+                        {formatBytes(app.apkSize)}
+                      </Text>
+
+                      {app.riskReasons.length > 0 && (
+                        <View style={styles.reasonsBox}>
+                          {app.riskReasons.map((reason, idx) => (
+                            <Text key={idx} style={styles.reasonText}>
+                              • {reason}
+                            </Text>
+                          ))}
+                        </View>
+                      )}
+
+                      {app.dangerousPermissions.length > 0 && (
+                        <Text style={styles.permsList}>
+                          Permissões: {app.dangerousPermissions.join(', ')}
+                        </Text>
+                      )}
+
+                      <TouchableOpacity
+                        style={styles.outlineBtn}
+                        onPress={() => AndroidScanner.openAppSettings(app.packageName)}
+                      >
+                        <Text style={styles.outlineBtnText}>Abrir Configurações / Desinstalar</Text>
                       </TouchableOpacity>
                     </View>
-                    {file.sha256 ? (
-                      <Text style={styles.hashText} numberOfLines={1}>
-                        SHA-256: {file.sha256}
+                  );
+                })}
+              </>
+            )}
+          </>
+        )}
+
+        {/* ==================== TELA 3: LIMPEZA DE ARQUIVOS ==================== */}
+        {activeTab === 'CLEANER' && (
+          <>
+            <View style={styles.sectionHeaderRow}>
+              <View>
+                <Text style={styles.pageTitle}>Limpeza de Arquivos</Text>
+                <Text style={styles.pageSub}>
+                  Espaço recuperável: {formatBytes(totalJunkBytes)}
+                </Text>
+              </View>
+              {junkFiles.length > 0 && (
+                <TouchableOpacity style={styles.cleanAllBtn} onPress={handleCleanAllJunk}>
+                  <Text style={styles.cleanAllText}>Limpar Tudo</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+
+            {!scanCompleted ? (
+              <View style={styles.emptyCard}>
+                <Text style={styles.emptyTitle}>Escaneie para localizar arquivos</Text>
+                <Text style={styles.emptySub}>
+                  Procuramos APKs esquecidos, arquivos temporários e vídeos/arquivos pesados nas pastas do sistema.
+                </Text>
+                <TouchableOpacity style={styles.primaryCta} onPress={() => runFullScan(false)}>
+                  <Text style={styles.primaryCtaText}>Buscar Arquivos para Limpar</Text>
+                </TouchableOpacity>
+              </View>
+            ) : junkFiles.length === 0 ? (
+              <View style={styles.emptyCard}>
+                <Text style={styles.emptyTitle}>Tudo limpo por aqui!</Text>
+                <Text style={styles.emptySub}>
+                  Nenhum APK residual, arquivo temporário ou arquivo pesado desnecessário encontrado.
+                </Text>
+              </View>
+            ) : (
+              junkFiles.map((file) => (
+                <View key={file.path} style={styles.itemCard}>
+                  <View style={styles.rowBetween}>
+                    <View style={{ flex: 1, paddingRight: 10 }}>
+                      <Text style={styles.itemTitle}>{file.name}</Text>
+                      <Text style={styles.itemSub}>
+                        {file.category} • Pasta: {file.folder} • {formatBytes(file.size)}
                       </Text>
-                    ) : null}
+                    </View>
+                    <TouchableOpacity
+                      style={styles.deleteBtn}
+                      onPress={() => handleDeleteSingleJunk(file)}
+                    >
+                      <Text style={styles.deleteBtnText}>Apagar</Text>
+                    </TouchableOpacity>
                   </View>
-                ))
-              ))}
+                  {file.sha256 ? (
+                    <Text style={styles.hashText} numberOfLines={1}>
+                      SHA-256: {file.sha256}
+                    </Text>
+                  ) : null}
+                </View>
+              ))
+            )}
+          </>
+        )}
+
+        {/* ==================== TELA 4: EXPLORADOR DE ARQUIVOS ==================== */}
+        {activeTab === 'FILES' && (
+          <>
+            <View style={styles.sectionHeaderRow}>
+              <View style={{ flex: 1, paddingRight: 8 }}>
+                <Text style={styles.pageTitle}>Gerenciador de Arquivos</Text>
+                <Text style={styles.pathText} numberOfLines={1}>
+                  {currentPath || '/storage/emulated/0'}
+                </Text>
+              </View>
+              <TouchableOpacity style={styles.miniRefreshBtn} onPress={handleNavigateUp}>
+                <Text style={styles.miniRefreshText}>↑ Voltar Pasta</Text>
+              </TouchableOpacity>
+            </View>
+
+            {storage && !storage.hasAllFilesAccess && (
+              <TouchableOpacity
+                style={styles.permissionBanner}
+                onPress={() => AndroidScanner.requestAllFilesAccess()}
+              >
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.permissionTitle}>Acesso restrito pelo Android</Text>
+                  <Text style={styles.permissionDesc}>
+                    Toque para liberar a leitura de todas as pastas e arquivos internos.
+                  </Text>
+                </View>
+                <View style={styles.permissionBtn}>
+                  <Text style={styles.permissionBtnText}>Liberar</Text>
+                </View>
+              </TouchableOpacity>
+            )}
+
+            {loadingFiles ? (
+              <ActivityIndicator color="#38BDF8" size="large" style={{ marginTop: 30 }} />
+            ) : dirEntries.length === 0 ? (
+              <View style={styles.emptyCard}>
+                <Text style={styles.emptyTitle}>Pasta vazia ou sem permissão</Text>
+                <Text style={styles.emptySub}>
+                  Nenhum arquivo visível neste diretório.
+                </Text>
+              </View>
+            ) : (
+              dirEntries.map((entry) => (
+                <TouchableOpacity
+                  key={entry.path}
+                  style={styles.fileRowCard}
+                  activeOpacity={entry.isDirectory ? 0.7 : 1}
+                  onPress={() => {
+                    if (entry.isDirectory) {
+                      loadDirectory(entry.path);
+                    }
+                  }}
+                >
+                  <View style={styles.fileIconBox}>
+                    <Text style={styles.fileIconText}>{entry.isDirectory ? 'DIR' : 'ARQ'}</Text>
+                  </View>
+
+                  <View style={{ flex: 1, paddingHorizontal: 10 }}>
+                    <Text style={styles.itemTitle} numberOfLines={1}>
+                      {entry.name}
+                    </Text>
+                    <Text style={styles.itemSub}>
+                      {entry.isDirectory
+                        ? `${entry.itemCount} item(ns)`
+                        : `${formatBytes(entry.size)} • ${formatDate(entry.lastModified)}`}
+                    </Text>
+                  </View>
+
+                  {!entry.isDirectory && (
+                    <TouchableOpacity
+                      style={styles.smallDeleteBtn}
+                      onPress={() => handleDeleteExplorerFile(entry)}
+                    >
+                      <Text style={styles.deleteBtnText}>Excluir</Text>
+                    </TouchableOpacity>
+                  )}
+                </TouchableOpacity>
+              ))
+            )}
           </>
         )}
       </ScrollView>
+
+      {/* Barra de Navegação Inferior */}
+      <View style={styles.bottomNav}>
+        {(
+          [
+            { id: 'HOME', label: 'Início' },
+            { id: 'REPORT', label: 'Relatório' },
+            { id: 'CLEANER', label: 'Limpeza' },
+            { id: 'FILES', label: 'Arquivos' },
+          ] as { id: ScreenTab; label: string }[]
+        ).map((tab) => {
+          const isActive = activeTab === tab.id;
+          return (
+            <TouchableOpacity
+              key={tab.id}
+              style={[styles.navItem, isActive && styles.navItemActive]}
+              onPress={() => setActiveTab(tab.id)}
+            >
+              <Text style={[styles.navLabel, isActive && styles.navLabelActive]}>{tab.label}</Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0B1120' },
-  scrollContent: { padding: 20, paddingBottom: 40 },
-  header: { marginBottom: 20, marginTop: 10 },
-  brand: { color: '#38BDF8', fontSize: 12, fontWeight: '700', letterSpacing: 1.5 },
-  title: { color: '#F8FAFC', fontSize: 26, fontWeight: '800', marginTop: 4 },
-  subtitle: { color: '#94A3B8', fontSize: 13, marginTop: 4 },
-  card: {
+  container: { flex: 1, backgroundColor: '#060B19' },
+  topBar: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingTop: 14,
+    paddingBottom: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#1E293B',
+  },
+  brandTag: { color: '#38BDF8', fontSize: 10, fontWeight: '800', letterSpacing: 1.4 },
+  topTitle: { color: '#F8FAFC', fontSize: 22, fontWeight: '800' },
+  devicePill: {
     backgroundColor: '#1E293B',
-    borderRadius: 14,
-    padding: 16,
-    marginBottom: 16,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 20,
     borderWidth: 1,
     borderColor: '#334155',
   },
-  cardTitle: { color: '#F8FAFC', fontSize: 15, fontWeight: '700' },
-  percentText: { color: '#38BDF8', fontSize: 14, fontWeight: '700' },
-  progressBarBg: {
-    height: 10,
+  devicePillText: { color: '#38BDF8', fontSize: 11, fontWeight: '700' },
+  scrollContent: { padding: 18, paddingBottom: 95 },
+  permissionBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1E1B4B',
+    borderColor: '#6366F1',
+    borderWidth: 1,
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 16,
+  },
+  permissionTitle: { color: '#E0E7FF', fontSize: 13, fontWeight: '800' },
+  permissionDesc: { color: '#A5B4FC', fontSize: 11, marginTop: 2 },
+  permissionBtn: {
+    backgroundColor: '#6366F1',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  permissionBtnText: { color: '#FFF', fontSize: 12, fontWeight: '800' },
+  heroCard: {
     backgroundColor: '#0F172A',
-    borderRadius: 6,
-    marginVertical: 12,
+    borderRadius: 20,
+    padding: 22,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#1E293B',
+    marginBottom: 16,
+  },
+  scoreRing: {
+    width: 116,
+    height: 116,
+    borderRadius: 58,
+    borderWidth: 6,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#060B19',
+    marginBottom: 12,
+  },
+  scoreValue: { fontSize: 28, fontWeight: '900' },
+  scoreSub: { color: '#94A3B8', fontSize: 10, fontWeight: '700', letterSpacing: 1.2 },
+  healthStatus: { fontSize: 18, fontWeight: '800' },
+  deviceSubtitle: { color: '#CBD5E1', fontSize: 13, marginTop: 4 },
+  lastScanText: { color: '#64748B', fontSize: 11, marginTop: 4 },
+  primaryCta: {
+    backgroundColor: '#38BDF8',
+    width: '100%',
+    paddingVertical: 15,
+    borderRadius: 14,
+    alignItems: 'center',
+    marginTop: 18,
+  },
+  primaryCtaText: { color: '#060B19', fontSize: 15, fontWeight: '900' },
+  stepIndicator: { color: '#38BDF8', fontSize: 12, marginTop: 10, fontWeight: '600' },
+  secondaryCta: {
+    marginTop: 10,
+    width: '100%',
+    paddingVertical: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#334155',
+    alignItems: 'center',
+    backgroundColor: '#1E293B',
+  },
+  secondaryCtaText: { color: '#F8FAFC', fontSize: 13, fontWeight: '700' },
+  metricsRow: { flexDirection: 'row', gap: 10, marginBottom: 18 },
+  metricCard: {
+    flex: 1,
+    backgroundColor: '#0F172A',
+    borderRadius: 14,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: '#1E293B',
+  },
+  metricLabel: { color: '#E2E8F0', fontSize: 12, fontWeight: '700' },
+  metricPercent: { color: '#38BDF8', fontSize: 12, fontWeight: '800' },
+  barBg: {
+    height: 7,
+    backgroundColor: '#1E293B',
+    borderRadius: 4,
+    marginVertical: 8,
     overflow: 'hidden',
   },
-  progressBarFill: { height: '100%', backgroundColor: '#38BDF8', borderRadius: 6 },
-  rowBetween: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  rowCenter: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center' },
-  metaText: { color: '#94A3B8', fontSize: 12 },
-  metaTextSmall: { color: '#CBD5E1', fontSize: 12, marginTop: 8 },
-  scanButton: {
-    backgroundColor: '#38BDF8',
-    paddingVertical: 16,
+  barFill: { height: '100%', backgroundColor: '#38BDF8', borderRadius: 4 },
+  metricDetail: { color: '#94A3B8', fontSize: 10 },
+  sectionHeading: { color: '#F8FAFC', fontSize: 15, fontWeight: '800', marginBottom: 10 },
+  toolsGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', gap: 10 },
+  toolCard: {
+    width: '48.3%',
+    backgroundColor: '#0F172A',
     borderRadius: 14,
-    alignItems: 'center',
-    marginBottom: 20,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: '#1E293B',
   },
-  scanButtonDisabled: { opacity: 0.7 },
-  scanButtonText: { color: '#0B1120', fontSize: 16, fontWeight: '800' },
-  statsGrid: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16, gap: 10 },
-  statBox: {
-    flex: 1,
-    backgroundColor: '#1E293B',
-    borderRadius: 12,
-    padding: 12,
+  toolTitle: { color: '#F8FAFC', fontSize: 14, fontWeight: '800' },
+  toolDesc: { color: '#94A3B8', fontSize: 11, marginTop: 4 },
+  sectionHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
     alignItems: 'center',
+    marginBottom: 14,
+  },
+  pageTitle: { color: '#F8FAFC', fontSize: 19, fontWeight: '800' },
+  pageSub: { color: '#38BDF8', fontSize: 12, fontWeight: '700', marginTop: 2 },
+  pathText: { color: '#94A3B8', fontSize: 11, marginTop: 2, fontFamily: 'monospace' },
+  miniRefreshBtn: {
+    backgroundColor: '#1E293B',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: '#334155',
   },
-  statNumber: { color: '#F8FAFC', fontSize: 18, fontWeight: '800' },
-  statLabel: { color: '#94A3B8', fontSize: 11, marginTop: 4 },
-  tabContainer: {
-    flexDirection: 'row',
-    backgroundColor: '#1E293B',
-    borderRadius: 12,
-    padding: 4,
-    marginBottom: 16,
+  miniRefreshText: { color: '#38BDF8', fontSize: 12, fontWeight: '700' },
+  cleanAllBtn: {
+    backgroundColor: '#EF4444',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 10,
   },
-  tabButton: { flex: 1, paddingVertical: 10, alignItems: 'center', borderRadius: 9 },
-  tabButtonActive: { backgroundColor: '#38BDF8' },
-  tabText: { color: '#94A3B8', fontWeight: '700', fontSize: 13 },
-  tabTextActive: { color: '#0B1120' },
+  cleanAllText: { color: '#FFF', fontSize: 12, fontWeight: '800' },
+  summaryCard: {
+    flexDirection: 'row',
+    backgroundColor: '#0F172A',
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 14,
+    borderWidth: 1,
+    borderColor: '#1E293B',
+  },
+  summaryItem: { flex: 1, alignItems: 'center' },
+  summaryVal: { color: '#F8FAFC', fontSize: 16, fontWeight: '900' },
+  summaryLbl: { color: '#94A3B8', fontSize: 11, marginTop: 2 },
+  filterRow: { flexDirection: 'row', gap: 8, marginBottom: 14 },
+  filterChip: {
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 20,
+    backgroundColor: '#0F172A',
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  filterChipActive: { backgroundColor: '#38BDF8', borderColor: '#38BDF8' },
+  filterChipText: { color: '#94A3B8', fontSize: 12, fontWeight: '700' },
+  filterChipTextActive: { color: '#060B19' },
   itemCard: {
-    backgroundColor: '#1E293B',
-    borderRadius: 12,
+    backgroundColor: '#0F172A',
+    borderRadius: 14,
     padding: 14,
     marginBottom: 12,
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: '#1E293B',
   },
-  itemTitle: { color: '#F8FAFC', fontSize: 15, fontWeight: '700' },
+  itemTitle: { color: '#F8FAFC', fontSize: 14, fontWeight: '700' },
   itemSub: { color: '#94A3B8', fontSize: 11, marginTop: 2 },
   badge: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6, borderWidth: 1 },
-  badgeText: { fontSize: 11, fontWeight: '800' },
+  badgeText: { fontSize: 10, fontWeight: '800' },
+  metaTextSmall: { color: '#CBD5E1', fontSize: 11, marginTop: 8 },
   reasonsBox: {
     marginTop: 8,
-    backgroundColor: '#0F172A',
+    backgroundColor: '#1E293B',
     padding: 10,
     borderRadius: 8,
   },
-  reasonText: { color: '#FBBF24', fontSize: 12, marginBottom: 2 },
-  actionOutlineBtn: {
+  reasonText: { color: '#FBBF24', fontSize: 11, marginBottom: 2 },
+  permsList: { color: '#94A3B8', fontSize: 10, marginTop: 6 },
+  outlineBtn: {
     marginTop: 10,
     borderWidth: 1,
-    borderColor: '#EF4444',
+    borderColor: '#334155',
     borderRadius: 8,
     paddingVertical: 8,
     alignItems: 'center',
+    backgroundColor: '#1E293B',
   },
-  actionOutlineText: { color: '#EF4444', fontSize: 12, fontWeight: '700' },
+  outlineBtnText: { color: '#E2E8F0', fontSize: 12, fontWeight: '700' },
   deleteBtn: {
     backgroundColor: '#EF4444',
     paddingHorizontal: 14,
     paddingVertical: 8,
     borderRadius: 8,
   },
-  deleteBtnText: { color: '#FFF', fontSize: 12, fontWeight: '700' },
+  smallDeleteBtn: {
+    backgroundColor: '#EF4444',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+  },
+  deleteBtnText: { color: '#FFF', fontSize: 11, fontWeight: '800' },
   hashText: { color: '#64748B', fontSize: 10, marginTop: 8, fontFamily: 'monospace' },
-  emptyText: { color: '#94A3B8', textAlign: 'center', fontSize: 13 },
+  emptyCard: {
+    backgroundColor: '#0F172A',
+    borderRadius: 16,
+    padding: 22,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#1E293B',
+  },
+  emptyTitle: { color: '#F8FAFC', fontSize: 16, fontWeight: '800', textAlign: 'center' },
+  emptySub: { color: '#94A3B8', fontSize: 12, textAlign: 'center', marginTop: 6 },
+  fileRowCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#0F172A',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: '#1E293B',
+  },
+  fileIconBox: {
+    width: 38,
+    height: 38,
+    borderRadius: 10,
+    backgroundColor: '#1E293B',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  fileIconText: { color: '#38BDF8', fontSize: 10, fontWeight: '900' },
+  rowBetween: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  rowCenter: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center' },
+  bottomNav: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    flexDirection: 'row',
+    backgroundColor: '#0F172A',
+    borderTopWidth: 1,
+    borderTopColor: '#1E293B',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  navItem: {
+    flex: 1,
+    alignItems: 'center',
+    paddingVertical: 8,
+    borderRadius: 10,
+  },
+  navItemActive: { backgroundColor: '#1E293B' },
+  navLabel: { color: '#64748B', fontSize: 12, fontWeight: '700' },
+  navLabelActive: { color: '#38BDF8' },
 });
