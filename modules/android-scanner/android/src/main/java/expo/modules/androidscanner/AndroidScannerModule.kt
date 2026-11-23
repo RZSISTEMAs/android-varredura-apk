@@ -264,10 +264,9 @@ class AndroidScannerModule : Module() {
         }
       }
 
-      entries.sortedWith(
-        compareByDescending> { it["isDirectory"] as Boolean }
-          .thenBy { (it["name"] as String).lowercase() }
-      )
+      val dirs = entries.filter { it["isDirectory"] as Boolean }.sortedBy { (it["name"] as String).lowercase() }
+      val files = entries.filter { !(it["isDirectory"] as Boolean) }.sortedBy { (it["name"] as String).lowercase() }
+      dirs + files
     }
 
     AsyncFunction("deleteFile") { filePath: String ->
