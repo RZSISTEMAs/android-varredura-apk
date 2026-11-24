@@ -5,7 +5,6 @@ import {
   AppState,
   PermissionsAndroid,
   Platform,
-  SafeAreaView,
   ScrollView,
   StatusBar,
   StyleSheet,
@@ -13,6 +12,10 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import {
+  SafeAreaProvider,
+  useSafeAreaInsets,
+} from 'react-native-safe-area-context';
 import AndroidScanner, {
   DirectoryEntry,
   JunkFile,
@@ -37,7 +40,8 @@ function formatDate(timestamp: number): string {
   return d.toLocaleDateString('pt-BR');
 }
 
-export default function App() {
+function MainApp() {
+  const insets = useSafeAreaInsets();
   const [activeTab, setActiveTab] = useState<ScreenTab>('HOME');
   const [storage, setStorage] = useState<StorageInfo | null>(null);
   const [apps, setApps] = useState<ScannedApp[]>([]);
@@ -232,7 +236,6 @@ export default function App() {
     loadDirectory(parent.length >= root.length ? parent : root);
   }
 
-  // Cálculos de saúde e estatísticas
   const highRiskCount = apps.filter((a) => a.riskLevel === 'ALTO').length;
   const mediumRiskCount = apps.filter((a) => a.riskLevel === 'MEDIO').length;
   const sideloadCount = apps.filter((a) => a.isSideloaded).length;
@@ -250,7 +253,6 @@ export default function App() {
         )
       : 0;
 
-  // Score de saúde do aparelho (0 a 100)
   const healthScore = !scanCompleted
     ? 92
     : Math.max(25, 100 - highRiskCount * 18 - mediumRiskCount * 7 - (junkFiles.length > 5 ? 8 : 0));
@@ -272,12 +274,16 @@ export default function App() {
     return true;
   });
 
-  return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#060B19" />
+  // Garante espaçamento seguro mesmo antes do inset carregar
+  const topInset = Math.max(insets.top, StatusBar.currentHeight || 24);
+  const bottomInset = Math.max(insets.bottom, 12);
 
-      {/* Top Bar */}
-      <View style={styles.topBar}>
+  return (
+    <View style={styles.container}>
+      <StatusBar barStyle="light-content" backgroundColor="#060B19" translucent />
+
+      {/* Top Bar com paddingTop dinâmico respeitando hora, Wi-Fi e câmera */}
+      <View style={[styles.topBar, { paddingTop: topInset + 10 }]}>
         <View>
           <Text style={styles.brandTag}>RZ SISTEMAS • SECURITY SUITE</Text>
           <Text style={styles.topTitle}>RZ Varredura</Text>
@@ -289,11 +295,16 @@ export default function App() {
         )}
       </View>
 
-      <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        contentContainerStyle={[
+          styles.scrollContent,
+          { paddingBottom: bottomInset + 82 },
+        ]}
+        showsVerticalScrollIndicator={false}
+      >
         {/* ==================== TELA 1: INÍCIO ==================== */}
         {activeTab === 'HOME' && (
           <>
-            {/* Banner de Permissão Android 15 */}
             {storage && !storage.hasAllFilesAccess && (
               <TouchableOpacity
                 style={styles.permissionBanner}
@@ -311,7 +322,6 @@ export default function App() {
               </TouchableOpacity>
             )}
 
-            {/* Card Principal com Medidor de Saúde */}
             <View style={styles.heroCard}>
               <View style={[styles.scoreRing, { borderColor: healthColor }]}>
                 <Text style={[styles.scoreValue, { color: healthColor }]}>{healthScore}%</Text>
@@ -357,7 +367,6 @@ export default function App() {
               )}
             </View>
 
-            {/* Métricas de Hardware (Armazenamento + RAM) */}
             {storage && (
               <View style={styles.metricsRow}>
                 <View style={styles.metricCard}>
@@ -395,7 +404,6 @@ export default function App() {
               </View>
             )}
 
-            {/* Ações Rápidas */}
             <Text style={styles.sectionHeading}>Ferramentas do Sistema</Text>
             <View style={styles.toolsGrid}>
               <TouchableOpacity style={styles.toolCard} onPress={() => setActiveTab('REPORT')}>
@@ -451,7 +459,6 @@ export default function App() {
               </View>
             ) : (
               <>
-                {/* Resumo Consolidado */}
                 <View style={styles.summaryCard}>
                   <View style={styles.summaryItem}>
                     <Text style={styles.summaryVal}>{apps.length}</Text>
@@ -473,7 +480,6 @@ export default function App() {
                   </View>
                 </View>
 
-                {/* Filtros */}
                 <View style={styles.filterRow}>
                   {(
                     [
@@ -499,7 +505,6 @@ export default function App() {
                   ))}
                 </View>
 
-                {/* Lista de Aplicativos */}
                 {filteredApps.map((app) => {
                   const badgeColor =
                     app.riskLevel === 'ALTO'
@@ -709,8 +714,8 @@ export default function App() {
         )}
       </ScrollView>
 
-      {/* Barra de Navegação Inferior */}
-      <View style={styles.bottomNav}>
+      {/* Barra de Navegação Inferior respeitando os botões/gestos do Android */}
+      <View style={[styles.bottomNav, { paddingBottom: bottomInset }]}>
         {(
           [
             { id: 'HOME', label: 'Início' },
@@ -731,7 +736,15 @@ export default function App() {
           );
         })}
       </View>
-    </SafeAreaView>
+    </View>
+  );
+}
+
+export default function App() {
+  return (
+    <SafeAreaProvider>
+      <MainApp />
+    </SafeAreaProvider>
   );
 }
 
@@ -742,8 +755,8 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingHorizontal: 20,
-    paddingTop: 14,
-    paddingBottom: 10,
+    paddingBottom: 12,
+    backgroundColor: '#060B19',
     borderBottomWidth: 1,
     borderBottomColor: '#1E293B',
   },
@@ -758,7 +771,7 @@ const styles = StyleSheet.create({
     borderColor: '#334155',
   },
   devicePillText: { color: '#38BDF8', fontSize: 11, fontWeight: '700' },
-  scrollContent: { padding: 18, paddingBottom: 95 },
+  scrollContent: { padding: 18 },
   permissionBanner: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -989,7 +1002,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#0F172A',
     borderTopWidth: 1,
     borderTopColor: '#1E293B',
-    paddingVertical: 10,
+    paddingTop: 10,
     paddingHorizontal: 12,
   },
   navItem: {
